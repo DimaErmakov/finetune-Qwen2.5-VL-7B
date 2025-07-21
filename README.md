@@ -4,6 +4,7 @@
 ### News/Updates
 * 2025/02/08
   * First version of the fine-tuning code is released.
+  * DIMITRY's NOTES on the code changes: This code was changed in order to utilize the seven billion parameter version of Qwen and to fine tune it on AgMMU (https://github.com/DimaErmakov/AgMMU). The only files that were changed are the Fine tune distributed Python file and the fine tune distributed bash file. You can also just look at my commits to see what exactly was changed.
 
 ### Introduction
 In the past five months since Qwen2-VL’s release, numerous developers have built new models on the Qwen2-VL vision-language models, providing us with valuable feedback. During this period, qwen team focused on building more useful vision-language models. Today, qwen team are excited to introduce the latest addition to the Qwen family: Qwen2.5-VL.
