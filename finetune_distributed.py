@@ -15,6 +15,22 @@ from util.logutil import init_logger, get_logger
 
 from accelerate import Accelerator, DeepSpeedPlugin
 
+def safe_process_vision_info(conversations, return_video_kwargs=False):
+    """
+    Safe wrapper around process_vision_info that handles corrupted images gracefully.
+    Returns None for image_inputs and video_inputs if all images/videos fail to load.
+    """
+    try:
+        return process_vision_info(conversations, return_video_kwargs)
+    except Exception as e:
+        # Log the error and return None values
+        if 'accelerator' in globals() and accelerator.is_local_main_process:
+            logger.warning(f"Failed to process vision info: {str(e)}")
+        if return_video_kwargs:
+            return None, None, {}
+        else:
+            return None, None
+
 print("Init deepspeed plugin...")
 # Create a DeepSpeedPlugin configuration object to customize DeepSpeed integration settings。
 deepspeed_plugin = DeepSpeedPlugin(
@@ -27,7 +43,7 @@ deepspeed_plugin = DeepSpeedPlugin(
     gradient_accumulation_steps=2,  # Accumulate gradients over 2 steps before optimization
     zero3_save_16bit_model=True,    # Save models in 16-bit precision when using ZeRO stage 3
                                     # Reduces model checkpoint size by 50% while maintaining model quality
-    offload_optimizer_device="cpu", # Offload optimizer computation to CPU to drastically reduce GPU memory usage
+    # offload_optimizer_device="cpu", # Offload optimizer computation to CPU to drastically reduce GPU memory usage
     offload_param_device="cpu"      # Offload model parameters to CPU to further decrease GPU memory consumption
 )
 print("Init deepspeed plugin done")
@@ -87,17 +103,81 @@ if accelerator.is_local_main_process:
     logger = get_logger()
 
 
-class ToyDataSet(Dataset): # for toy demo, for train_data/data.json
-    def __init__(self, data_path):
+class AgMMUDataset(Dataset):
+    """Dataset for AgMMU fine-tuning data"""
+    def __init__(self, data_path, image_base_path="/u/dermakov/AgMMU/data"):
         super().__init__()
         with open(data_path, "r") as f:
-            self.data = json.load(f)
+            self.raw_data = json.load(f)
+        
+        self.image_base_path = image_base_path
+        self.processed_data = []
+        
+        skipped_count = 0
+        total_count = 0
+        
+        # Process the data into the required format
+        for item in self.raw_data:
+            faq_id = item["faq-id"]
+            images = item["images"]
+            qa_pairs = item["finetuning qa"]
+            
+            # Create a separate training example for each QA pair
+            for qa_type, qa_data in qa_pairs.items():
+                if isinstance(qa_data, dict) and "q" in qa_data and "a" in qa_data:
+                    total_count += 1
+                    # Try different image extensions and paths
+                    image_path = None
+                    possible_paths = [
+                        # os.path.join("/projects/bczp/dermakov/images_ft", str(faq_id), f"{faq_id}_1.jpg"),
+                        os.path.join("/work/nvme/bdbf/dermakov/agmmu/AgMMU_v1/images_ft_cleanv2", str(faq_id), f"{faq_id}_1.jpg"),
+                        # os.path.join("/work/nvme/bdbf/dermakov/agmmu/AgMMU_v1/images_ft", str(faq_id), f"{faq_id}_1.png"),
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            # Test if the image can be opened successfully
+                            try:
+                                from PIL import Image
+                                with Image.open(path) as img:
+                                    img.verify()  # Verify the image can be opened
+                                image_path = path
+                                break
+                            except Exception as e:
+                                # Log the corrupted image and continue to next path
+                                print(f"Warning: Corrupted image {path}: {str(e)}")
+                                continue
+                    
+                    if image_path is None:
+                        skipped_count += 1
+                        # print(f"Skipping {faq_id}: No valid image found in any of the expected locations")
+                        continue
+                    
+                    # Create the message format expected by Qwen2.5-VL
+                    message = {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": image_path},
+                                    {"type": "text", "text": qa_data["q"]}
+                                ]
+                            },
+                            {
+                                "role": "assistant", 
+                                "content": [{"type": "text", "text": qa_data["a"]}]
+                            }
+                        ]
+                    }
+                    self.processed_data.append(message)
+        
+        print(f"Dataset initialization complete: {len(self.processed_data)} valid samples, {skipped_count} skipped out of {total_count} total")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.processed_data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        return self.processed_data[idx]
     
 def find_assistant_content_sublist_indexes(l):
     '''
@@ -142,7 +222,10 @@ def collate_fn(batch, processor, device):
 
     messages = [m['messages'] for m in batch]
     texts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) for msg in messages]
-    image_inputs, video_inputs = process_vision_info(messages)
+    
+    # Use safe wrapper for vision processing
+    image_inputs, video_inputs = safe_process_vision_info(messages)
+    
     inputs = processor(
         text=texts,
         images=image_inputs,
@@ -188,17 +271,13 @@ def write_chat_template(processor, output_dir):
 def train():
     # Load the model on the available device(s)
     # We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
-    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    #     "Qwen/Qwen2.5-VL-3B-Instruct",
-    #     torch_dtype=torch.bfloat16,
-    #     attn_implementation="flash_attention_2",
-    #     device_map="auto",
-    # )
-    print("Loading model...")
+    print("Loading Qwen2.5-VL-7B model...")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen2.5-VL-3B-Instruct", torch_dtype="bfloat16"
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        torch_dtype=torch.bfloat16,
+        # attn_implementation="flash_attention_2",  # Removed due to glibc incompatibility
+        # device_map="auto",
     )
-
 
     # Load processor. 
     # The default range for the number of visual tokens per image in the model is 4-16384. You can set min_pixels and max_pixels according to your needs, such as a token count range of 256-1280, to balance speed and memory usage.
@@ -216,9 +295,11 @@ def train():
     # https://github.com/pytorch/pytorch/issues/110213
     # transformers/models/qwen2_vl/modeling_qwen2_vl.py: causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
     
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct", min_pixels=128*28*28, max_pixels=256*28*28, padding_side="right")
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", min_pixels=128*28*28, max_pixels=256*28*28, padding_side="right")
+    
+    # Use AgMMU dataset
     train_loader = DataLoader(
-        ToyDataSet("train_data/data.json"),
+        AgMMUDataset("/u/dermakov/AgMMU/data/agmmu_ft_hf1.json"),
         batch_size=1,
         collate_fn=partial(collate_fn, processor=processor, device=device)
     )
@@ -263,5 +344,9 @@ def train():
         write_chat_template(processor, output_dir)
 
 if __name__ == "__main__":
+    import torch
+    print("PyTorch CUDA version:", torch.version.cuda)
+    print("CUDA available:", torch.cuda.is_available())
+    print("CUDA device count:", torch.cuda.device_count())
     train()
 
